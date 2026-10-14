@@ -1,0 +1,634 @@
+﻿
+========== lib\models.dart ==========
+import 'dart:math';
+
+const channelNames = ['Pressure (kPa)', 'Motor (RPM)', 'Temperature (C)', 'Flow (L/min)'];
+const channelShort = ['Pressure', 'Motor RPM', 'Temperature', 'Flow'];
+
+class Telemetry {
+  const Telemetry(this.time, this.v);
+  final DateTime time;
+  final List<double> v; // pressure, rpm, temperature, flow
+}
+
+class AlertRecord {
+  const AlertRecord({
+    required this.time,
+    required this.source,
+    required this.channel,
+    required this.score,
+    required this.severity,
+  });
+  final DateTime time;
+  final String source;
+  final String channel;
+  final double score;
+  final String severity;
+
+  Map<String, dynamic> toJson() => {
+        'time': time.toIso8601String(),
+        'source': source,
+        'channel': channel,
+        'score': score,
+        'severity': severity,
+      };
+
+  factory AlertRecord.fromJson(Map<String, dynamic> j) => AlertRecord(
+        time: DateTime.parse(j['time'] as String),
+        source: j['source'] as String,
+        channel: j['channel'] as String,
+        score: (j['score'] as num).toDouble(),
+        severity: j['severity'] as String,
+      );
+}
+
+String severityFor(double score, double threshold) {
+  if (score >= threshold * 2.5) return 'Critical';
+  if (score >= threshold * 1.5) return 'High';
+  return 'Warning';
+}
+
+class Episode {
+  const Episode(this.start, this.end, this.peak, this.channel);
+  final int start;
+  final int end;
+  final double peak;
+  final int channel;
+}
+
+class AnalysisResult {
+  const AnalysisResult({
+    required this.scores,
+    required this.anomalies,
+    required this.episodes,
+    required this.baselineCount,
+  });
+  final List<double> scores;
+  final List<int> anomalies;
+  final List<Episode> episodes;
+  final int baselineCount;
+  double get maxScore => scores.isEmpty ? 0.0 : scores.reduce(max);
+}
+
+========== lib\models\telemetry_sample.dart ==========
+class TelemetrySample {
+  final DateTime timestamp;
+  final double pressureKpa;
+  final double motorRpm;
+  final double temperatureC;
+  final double flowLpm;
+
+  TelemetrySample({
+    required this.timestamp,
+    required this.pressureKpa,
+    required this.motorRpm,
+    required this.temperatureC,
+    required this.flowLpm,
+  });
+
+  factory TelemetrySample.fromMap(Map<String, dynamic> map) {
+    return TelemetrySample(
+      timestamp: DateTime.parse(map['timestamp'] as String),
+      pressureKpa: (map['pressure_kpa'] as num).toDouble(),
+      motorRpm: (map['motor_rpm'] as num).toDouble(),
+      temperatureC: (map['temperature_c'] as num).toDouble(),
+      flowLpm: (map['flow_lpm'] as num).toDouble(),
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'timestamp': timestamp.toIso8601String(),
+      'pressure_kpa': pressureKpa,
+      'motor_rpm': motorRpm,
+      'temperature_c': temperatureC,
+      'flow_lpm': flowLpm,
+    };
+  }
+}
+
+========== lib\app_state.dart ==========
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'detector.dart';
+import 'models.dart';
+import 'services/storage.dart';
+import 'simulator.dart';
+
+final appState = AppState();
+
+class AppState extends ChangeNotifier {
+  // navigation
+  final ValueNotifier<int> tab = ValueNotifier<int>(0);
+  void goTo(int i) => tab.value = i;
+
+  // settings
+  double threshold = 3.0;
+  double alpha = 0.05;
+  int intervalMs = 500;
+
+  // live simulation
+  final Simulator sim = Simulator();
+  Detector _det = Detector();
+  final List<Telemetry> _warm = [];
+  static const warmupSamples = 60;
+  final List<Telemetry> live = [];
+  Telemetry? latest;
+  double score = 0;
+  int scoreChannel = 0;
+  bool running = false;
+  Timer? _timer;
+  DateTime? _lastAlert;
+
+  bool get learning => !_det.fitted;
+  bool get alarm => _det.fitted && score > threshold;
+  bool get driftActive => sim.driftStart != null;
+  double get warmupProgress => min(1.0, _warm.length / warmupSamples);
+
+  // import + analysis
+  List<Telemetry> imported = [];
+  String importedName = '';
+  AnalysisResult? analysis;
+  bool findingsSaved = false;
+
+  // alerts
+  List<AlertRecord> alerts = [];
+
+  Future<void> init() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      threshold = p.getDouble('threshold') ?? 3.0;
+      alpha = p.getDouble('alpha') ?? 0.05;
+      intervalMs = p.getInt('intervalMs') ?? 500;
+    } catch (_) {}
+    alerts = await Storage.loadAlerts();
+    _det = Detector(alpha: alpha);
+    startLive();
+  }
+
+  Future<void> saveSettings() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setDouble('threshold', threshold);
+      await p.setDouble('alpha', alpha);
+      await p.setInt('intervalMs', intervalMs);
+    } catch (_) {}
+  }
+
+  void setThreshold(double v) {
+    threshold = v;
+    notifyListeners();
+  }
+
+  void setAlpha(double v) {
+    alpha = v;
+    notifyListeners();
+  }
+
+  void commitAlpha() {
+    _det = Detector(alpha: alpha);
+    _warm.clear();
+    score = 0;
+    saveSettings();
+    notifyListeners();
+  }
+
+  void setInterval(int ms) {
+    intervalMs = ms;
+    if (running) startLive();
+    saveSettings();
+    notifyListeners();
+  }
+
+  // ---- live ----
+  void startLive() {
+    _timer?.cancel();
+    running = true;
+    _timer = Timer.periodic(Duration(milliseconds: intervalMs), (_) => _tick());
+    notifyListeners();
+  }
+
+  void pauseLive() {
+    _timer?.cancel();
+    running = false;
+    notifyListeners();
+  }
+
+  void resetLive() {
+    sim.clearDrift();
+    live.clear();
+    _warm.clear();
+    _det = Detector(alpha: alpha);
+    latest = null;
+    score = 0;
+    notifyListeners();
+  }
+
+  void injectDrift() {
+    sim.injectDrift();
+    notifyListeners();
+  }
+
+  void _tick() {
+    final t = sim.next();
+    latest = t;
+    live.add(t);
+    if (live.length > 300) live.removeAt(0);
+    if (!_det.fitted) {
+      _warm.add(t);
+      if (_warm.length >= warmupSamples) _det.fit(_warm);
+    } else {
+      final r = _det.update(t);
+      score = r.score;
+      scoreChannel = r.channel;
+      if (score > threshold) _maybeLogAlert(t);
+    }
+    notifyListeners();
+  }
+
+  void _maybeLogAlert(Telemetry t) {
+    final now = DateTime.now();
+    if (_lastAlert != null && now.difference(_lastAlert!).inSeconds < 15) return;
+    _lastAlert = now;
+    alerts.insert(
+      0,
+      AlertRecord(
+        time: t.time,
+        source: 'Live simulation',
+        channel: channelShort[scoreChannel],
+        score: score,
+        severity: severityFor(score, threshold),
+      ),
+    );
+    if (alerts.length > 500) alerts.removeLast();
+    Storage.saveAlerts(alerts);
+  }
+
+  // ---- import / analysis ----
+  void setImported(String name, List<Telemetry> rows) {
+    imported = rows;
+    importedName = name;
+    analysis = null;
+    findingsSaved = false;
+    notifyListeners();
+  }
+
+  void analyzeImported() {
+    final n = imported.length;
+    if (n < 30) return;
+    final baseCount = min(max(30, (n * 0.2).round()), n - 10);
+    final det = Detector(alpha: alpha)..fit(imported.sublist(0, baseCount));
+    final scores = <double>[];
+    final chans = <int>[];
+    for (var i = 0; i < n; i++) {
+      final r = det.update(imported[i]);
+      scores.add(i < baseCount ? 0.0 : r.score);
+      chans.add(r.channel);
+    }
+    final anomalies = <int>[];
+    final episodes = <Episode>[];
+    int? start;
+    var peak = 0.0;
+    var pch = 0;
+    var last = -1;
+    for (var i = baseCount; i < n; i++) {
+      if (scores[i] > threshold) {
+        anomalies.add(i);
+        if (start == null) {
+          start = i;
+          peak = 0.0;
+        }
+        if (scores[i] > peak) {
+          peak = scores[i];
+          pch = chans[i];
+        }
+        last = i;
+      } else if (start != null) {
+        episodes.add(Episode(start, last, peak, pch));
+        start = null;
+      }
+    }
+    if (start != null) episodes.add(Episode(start, last, peak, pch));
+    analysis = AnalysisResult(
+      scores: scores,
+      anomalies: anomalies,
+      episodes: episodes,
+      baselineCount: baseCount,
+    );
+    findingsSaved = false;
+    notifyListeners();
+  }
+
+  Future<int> saveFindings() async {
+    final a = analysis;
+    if (a == null) return 0;
+    for (final e in a.episodes) {
+      alerts.insert(
+        0,
+        AlertRecord(
+          time: imported[e.start].time,
+          source: importedName,
+          channel: channelShort[e.channel],
+          score: e.peak,
+          severity: severityFor(e.peak, threshold),
+        ),
+      );
+    }
+    findingsSaved = true;
+    notifyListeners();
+    await Storage.saveAlerts(alerts);
+    return a.episodes.length;
+  }
+
+  Future<void> clearAlerts() async {
+    alerts.clear();
+    notifyListeners();
+    await Storage.saveAlerts(alerts);
+  }
+
+  String _stamp() => DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+
+  Future<String> exportAlerts() {
+    final rows = <List<dynamic>>[
+      <dynamic>['time', 'source', 'channel', 'score', 'severity'],
+      for (final a in alerts)
+        <dynamic>[a.time.toIso8601String(), a.source, a.channel, a.score.toStringAsFixed(2), a.severity],
+    ];
+    return Storage.exportCsv('gridsentinel_alerts_${_stamp()}.csv', rows);
+  }
+
+  Future<String> exportReport() {
+    final a = analysis!;
+    final flagged = a.anomalies.toSet();
+    final rows = <List<dynamic>>[
+      <dynamic>['timestamp', 'pressure_kpa', 'motor_rpm', 'temperature_c', 'flow_lpm', 'anomaly_score', 'flagged'],
+    ];
+    for (var i = 0; i < imported.length; i++) {
+      final t = imported[i];
+      rows.add(<dynamic>[
+        t.time.toIso8601String(),
+        ...t.v.map((x) => x.toStringAsFixed(3)),
+        a.scores[i].toStringAsFixed(2),
+        flagged.contains(i) ? 1 : 0,
+      ]);
+    }
+    return Storage.exportCsv('gridsentinel_report_${_stamp()}.csv', rows);
+  }
+}
+
+========== lib\services\cnn_service.dart ==========
+import 'dart:math' as math;
+import 'dart:convert';
+import 'package:flutter/services.dart';
+import '../models/telemetry_sample.dart';
+
+class CnnService {
+  Map<String, dynamic>? _modelData;
+  bool _isLoaded = false;
+
+  bool get isLoaded => _isLoaded;
+
+  Future<void> loadModel() async {
+    if (_isLoaded) return;
+    try {
+      String jsonString = await rootBundle.loadString('assets/models/gridsentinel_weights.json');
+      _modelData = json.decode(jsonString);
+      _isLoaded = true;
+    } catch (e) {
+      // ignore: avoid_print
+      print('Error loading CNN model weights: $e');
+      _isLoaded = false;
+    }
+  }
+
+  List<List<double>> _preprocessWindow(List<TelemetrySample> window) {
+    var normConfig = _modelData!['normalization'];
+    List mean = normConfig['mean'];
+    List std = normConfig['std'];
+
+    List<List<double>> normalized = [];
+    for (var sample in window) {
+      List<double> raw = [
+        sample.pressureKpa,
+        sample.motorRpm,
+        sample.temperatureC,
+        sample.flowLpm,
+      ];
+      List<double> scaled = [];
+      for (int i = 0; i < raw.length; i++) {
+        double val = (raw[i] - mean[i]) / (std[i] + 1e-8);
+        scaled.add(val);
+      }
+      normalized.add(scaled);
+    }
+    return normalized;
+  }
+
+  double predict(List<TelemetrySample> window) {
+    if (!_isLoaded || _modelData == null) {
+      throw Exception('CNN model weights are not loaded.');
+    }
+
+    if (window.length != 50) {
+      throw ArgumentError('Input window must contain exactly 50 samples.');
+    }
+
+    List<List<double>> normWindow = _preprocessWindow(window);
+    int channels = 4;
+    int length = 50;
+    List<List<double>> x = List.generate(channels, (c) => List.generate(length, (l) => normWindow[l][c]));
+
+    var weights = _modelData!['weights'];
+
+    x = _conv1d(x, weights['conv1_weight'], weights['conv1_bias'], padding: 1);
+    x = _relu2d(x);
+    x = _maxPool1d(x, kernelSize: 2, stride: 2);
+
+    x = _conv1d(x, weights['conv2_weight'], weights['conv2_bias'], padding: 1);
+    x = _relu2d(x);
+    x = _maxPool1d(x, kernelSize: 2, stride: 2);
+
+    List<double> flattened = [];
+    for (var ch in x) {
+      flattened.addAll(ch);
+    }
+
+    List<double> fc1Out = _linear(flattened, weights['fc1_weight'], weights['fc1_bias']);
+    fc1Out = fc1Out.map((v) => v > 0 ? v : 0.0).toList();
+
+    List<double> fc2Out = _linear(fc1Out, weights['fc2_weight'], weights['fc2_bias']);
+    
+    double score = 1.0 / (1.0 + math.exp(-fc2Out[0]));
+    return score;
+  }
+
+  List<List<double>> _conv1d(List<List<double>> input, List weight, List bias, {int padding = 1}) {
+    int cIn = input.length;
+    int length = input[0].length;
+    int cOut = weight.length;
+    int kernelSize = weight[0][0].length;
+
+    List<List<double>> output = List.generate(cOut, (_) => List.filled(length, 0.0));
+
+    for (int o = 0; o < cOut; o++) {
+      double b = bias[o];
+      for (int l = 0; l < length; l++) {
+        double sum = b;
+        for (int c = 0; c < cIn; c++) {
+          for (int k = 0; k < kernelSize; k++) {
+            int inpIdx = l + k - padding;
+            if (inpIdx >= 0 && inpIdx < length) {
+              sum += input[c][inpIdx] * weight[o][c][k];
+            }
+          }
+        }
+        output[o][l] = sum;
+      }
+    }
+    return output;
+  }
+
+  List<List<double>> _relu2d(List<List<double>> input) {
+    return input.map((row) => row.map((v) => v > 0 ? v : 0.0).toList()).toList();
+  }
+
+  List<List<double>> _maxPool1d(List<List<double>> input, {int kernelSize = 2, int stride = 2}) {
+    int cIn = input.length;
+    int inLen = input[0].length;
+    int outLen = (inLen / stride).floor();
+
+    List<List<double>> output = List.generate(cIn, (_) => List.filled(outLen, 0.0));
+
+    for (int c = 0; c < cIn; c++) {
+      for (int i = 0; i < outLen; i++) {
+        int start = i * stride;
+        int end = start + kernelSize;
+        if (end > inLen) end = inLen;
+        double maxVal = input[c][start];
+        for (int j = start + 1; j < end; j++) {
+          if (input[c][j] > maxVal) maxVal = input[c][j];
+        }
+        output[c][i] = maxVal;
+      }
+    }
+    return output;
+  }
+
+  List<double> _linear(List<double> input, List weight, List bias) {
+    int outFeatures = weight.length;
+    int inFeatures = weight[0].length;
+    List<double> output = List.filled(outFeatures, 0.0);
+
+    for (int i = 0; i < outFeatures; i++) {
+      double sum = bias[i];
+      for (int j = 0; j < inFeatures; j++) {
+        sum += input[j] * weight[i][j];
+      }
+      output[i] = sum;
+    }
+    return output;
+  }
+}
+
+========== lib\services\storage.dart ==========
+import 'dart:convert';
+import 'dart:io';
+import 'package:csv/csv.dart';
+import 'package:path_provider/path_provider.dart';
+import '../models.dart';
+
+class Storage {
+  static Future<File> _alertsFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}${Platform.pathSeparator}gridsentinel_alerts.json');
+  }
+
+  static Future<List<AlertRecord>> loadAlerts() async {
+    try {
+      final f = await _alertsFile();
+      if (!await f.exists()) return [];
+      final list = jsonDecode(await f.readAsString()) as List<dynamic>;
+      return list.map((e) => AlertRecord.fromJson(e as Map<String, dynamic>)).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> saveAlerts(List<AlertRecord> alerts) async {
+    try {
+      final f = await _alertsFile();
+      await f.writeAsString(jsonEncode(alerts.map((a) => a.toJson()).toList()));
+    } catch (_) {}
+  }
+
+  static Future<String> exportCsv(String name, List<List<dynamic>> rows) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final f = File('${dir.path}${Platform.pathSeparator}$name');
+    await f.writeAsString(const ListToCsvConverter().convert(rows));
+    return f.path;
+  }
+}
+
+========== test\import_service_test.dart ==========
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gridsentinel/services/import_service.dart';
+
+void main() {
+  group('ImportService Validation Tests', () {
+    final importService = ImportService();
+
+    test('Parses valid CSV correctly', () async {
+      const validCsv = '''
+timestamp,pressure_kpa,motor_rpm,temperature_c,flow_lpm
+2026-10-12T10:00:00Z,220.1,1480,41.2,75.4
+2026-10-12T10:00:01Z,220.0,1482,41.2,75.5
+''';
+
+      final result = await importService.parseCsv(validCsv);
+      expect(result.isValid, true);
+      expect(result.samples.length, 2);
+      expect(result.samples[0].pressureKpa, 220.1);
+    });
+
+    test('Fails on empty CSV', () async {
+      final result = await importService.parseCsv('');
+      expect(result.isValid, false);
+      expect(result.errors, contains('File is empty.'));
+    });
+
+    test('Fails on missing required headers', () async {
+      const invalidHeaderCsv = '''
+timestamp,pressure_kpa,motor_rpm
+2026-10-12T10:00:00Z,220.1,1480
+''';
+
+      final result = await importService.parseCsv(invalidHeaderCsv);
+      expect(result.isValid, false);
+      expect(result.errors.any((e) => e.contains('Missing required column header')), true);
+    });
+
+    test('Catches malformed rows with non-numeric values', () async {
+      const malformedCsv = '''
+timestamp,pressure_kpa,motor_rpm,temperature_c,flow_lpm
+2026-10-12T10:00:00Z,abc,1480,41.2,75.4
+''';
+
+      final result = await importService.parseCsv(malformedCsv);
+      expect(result.isValid, false);
+      expect(result.errors.any((e) => e.contains('Non-numeric sensor reading')), true);
+    });
+
+    test('Catches invalid timestamps', () async {
+      const badTimestampCsv = '''
+timestamp,pressure_kpa,motor_rpm,temperature_c,flow_lpm
+not-a-date,220.1,1480,41.2,75.4
+''';
+
+      final result = await importService.parseCsv(badTimestampCsv);
+      expect(result.isValid, false);
+      expect(result.errors.any((e) => e.contains('Invalid timestamp format')), true);
+    });
+  });
+}

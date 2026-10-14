@@ -1,0 +1,269 @@
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'detector.dart';
+import 'models.dart';
+import 'services/storage.dart';
+import 'simulator.dart';
+
+final appState = AppState();
+
+class AppState extends ChangeNotifier {
+  // navigation
+  final ValueNotifier<int> tab = ValueNotifier<int>(0);
+  void goTo(int i) => tab.value = i;
+
+  // settings
+  double threshold = 3.0;
+  double alpha = 0.05;
+  int intervalMs = 500;
+
+  // live simulation
+  final Simulator sim = Simulator();
+  Detector _det = Detector();
+  final List<Telemetry> _warm = [];
+  static const warmupSamples = 60;
+  final List<Telemetry> live = [];
+  Telemetry? latest;
+  double score = 0;
+  int scoreChannel = 0;
+  bool running = false;
+  Timer? _timer;
+  DateTime? _lastAlert;
+
+  bool get learning => !_det.fitted;
+  bool get alarm => _det.fitted && score > threshold;
+  bool get driftActive => sim.driftStart != null;
+  double get warmupProgress => min(1.0, _warm.length / warmupSamples);
+
+  // import + analysis
+  List<Telemetry> imported = [];
+  String importedName = '';
+  AnalysisResult? analysis;
+  bool findingsSaved = false;
+
+  // alerts
+  List<AlertRecord> alerts = [];
+
+  Future<void> init() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      threshold = p.getDouble('threshold') ?? 3.0;
+      alpha = p.getDouble('alpha') ?? 0.05;
+      intervalMs = p.getInt('intervalMs') ?? 500;
+    } catch (_) {}
+    alerts = await Storage.loadAlerts();
+    _det = Detector(alpha: alpha);
+    startLive();
+  }
+
+  Future<void> saveSettings() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setDouble('threshold', threshold);
+      await p.setDouble('alpha', alpha);
+      await p.setInt('intervalMs', intervalMs);
+    } catch (_) {}
+  }
+
+  void setThreshold(double v) {
+    threshold = v;
+    notifyListeners();
+  }
+
+  void setAlpha(double v) {
+    alpha = v;
+    notifyListeners();
+  }
+
+  void commitAlpha() {
+    _det = Detector(alpha: alpha);
+    _warm.clear();
+    score = 0;
+    saveSettings();
+    notifyListeners();
+  }
+
+  void setInterval(int ms) {
+    intervalMs = ms;
+    if (running) startLive();
+    saveSettings();
+    notifyListeners();
+  }
+
+  // ---- live ----
+  void startLive() {
+    _timer?.cancel();
+    running = true;
+    _timer = Timer.periodic(Duration(milliseconds: intervalMs), (_) => _tick());
+    notifyListeners();
+  }
+
+  void pauseLive() {
+    _timer?.cancel();
+    running = false;
+    notifyListeners();
+  }
+
+  void resetLive() {
+    sim.clearDrift();
+    live.clear();
+    _warm.clear();
+    _det = Detector(alpha: alpha);
+    latest = null;
+    score = 0;
+    notifyListeners();
+  }
+
+  void injectDrift() {
+    sim.injectDrift();
+    notifyListeners();
+  }
+
+  void _tick() {
+    final t = sim.next();
+    latest = t;
+    live.add(t);
+    if (live.length > 300) live.removeAt(0);
+    if (!_det.fitted) {
+      _warm.add(t);
+      if (_warm.length >= warmupSamples) _det.fit(_warm);
+    } else {
+      final r = _det.update(t);
+      score = r.score;
+      scoreChannel = r.channel;
+      if (score > threshold) _maybeLogAlert(t);
+    }
+    notifyListeners();
+  }
+
+  void _maybeLogAlert(Telemetry t) {
+    final now = DateTime.now();
+    if (_lastAlert != null && now.difference(_lastAlert!).inSeconds < 15) return;
+    _lastAlert = now;
+    alerts.insert(
+      0,
+      AlertRecord(
+        time: t.time,
+        source: 'Live simulation',
+        channel: channelShort[scoreChannel],
+        score: score,
+        severity: severityFor(score, threshold),
+      ),
+    );
+    if (alerts.length > 500) alerts.removeLast();
+    Storage.saveAlerts(alerts);
+  }
+
+  // ---- import / analysis ----
+  void setImported(String name, List<Telemetry> rows) {
+    imported = rows;
+    importedName = name;
+    analysis = null;
+    findingsSaved = false;
+    notifyListeners();
+  }
+
+  void analyzeImported() {
+    final n = imported.length;
+    if (n < 30) return;
+    final baseCount = min(max(30, (n * 0.2).round()), n - 10);
+    final det = Detector(alpha: alpha)..fit(imported.sublist(0, baseCount));
+    final scores = <double>[];
+    final chans = <int>[];
+    for (var i = 0; i < n; i++) {
+      final r = det.update(imported[i]);
+      scores.add(i < baseCount ? 0.0 : r.score);
+      chans.add(r.channel);
+    }
+    final anomalies = <int>[];
+    final episodes = <Episode>[];
+    int? start;
+    var peak = 0.0;
+    var pch = 0;
+    var last = -1;
+    for (var i = baseCount; i < n; i++) {
+      if (scores[i] > threshold) {
+        anomalies.add(i);
+        if (start == null) {
+          start = i;
+          peak = 0.0;
+        }
+        if (scores[i] > peak) {
+          peak = scores[i];
+          pch = chans[i];
+        }
+        last = i;
+      } else if (start != null) {
+        episodes.add(Episode(start, last, peak, pch));
+        start = null;
+      }
+    }
+    if (start != null) episodes.add(Episode(start, last, peak, pch));
+    analysis = AnalysisResult(
+      scores: scores,
+      anomalies: anomalies,
+      episodes: episodes,
+      baselineCount: baseCount,
+    );
+    findingsSaved = false;
+    notifyListeners();
+  }
+
+  Future<int> saveFindings() async {
+    final a = analysis;
+    if (a == null) return 0;
+    for (final e in a.episodes) {
+      alerts.insert(
+        0,
+        AlertRecord(
+          time: imported[e.start].time,
+          source: importedName,
+          channel: channelShort[e.channel],
+          score: e.peak,
+          severity: severityFor(e.peak, threshold),
+        ),
+      );
+    }
+    findingsSaved = true;
+    notifyListeners();
+    await Storage.saveAlerts(alerts);
+    return a.episodes.length;
+  }
+
+  Future<void> clearAlerts() async {
+    alerts.clear();
+    notifyListeners();
+    await Storage.saveAlerts(alerts);
+  }
+
+  String _stamp() => DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+
+  Future<String> exportAlerts() {
+    final rows = <List<dynamic>>[
+      <dynamic>['time', 'source', 'channel', 'score', 'severity'],
+      for (final a in alerts)
+        <dynamic>[a.time.toIso8601String(), a.source, a.channel, a.score.toStringAsFixed(2), a.severity],
+    ];
+    return Storage.exportCsv('gridsentinel_alerts_${_stamp()}.csv', rows);
+  }
+
+  Future<String> exportReport() {
+    final a = analysis!;
+    final flagged = a.anomalies.toSet();
+    final rows = <List<dynamic>>[
+      <dynamic>['timestamp', 'pressure_kpa', 'motor_rpm', 'temperature_c', 'flow_lpm', 'anomaly_score', 'flagged'],
+    ];
+    for (var i = 0; i < imported.length; i++) {
+      final t = imported[i];
+      rows.add(<dynamic>[
+        t.time.toIso8601String(),
+        ...t.v.map((x) => x.toStringAsFixed(3)),
+        a.scores[i].toStringAsFixed(2),
+        flagged.contains(i) ? 1 : 0,
+      ]);
+    }
+    return Storage.exportCsv('gridsentinel_report_${_stamp()}.csv', rows);
+  }
+}
