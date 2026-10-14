@@ -1,0 +1,66 @@
+name: Build Gridsentinel Applications
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Build Android APK
+        run: flutter build apk --release
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gridsentinel-Android-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Build Windows Executable
+        run: flutter build windows --release
+
+      - name: Compress Windows Release Bundle
+        run: |
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "Gridsentinel-Windows-x64.zip"
+
+      - name: Upload Windows Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gridsentinel-Windows-EXE
+          path: Gridsentinel-Windows-x64.zip
